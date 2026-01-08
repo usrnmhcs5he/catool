@@ -1,15 +1,82 @@
-# catool 
+# Certificate Generator Script
 
-oneliner to quickly create CA (if not existent already) and issue RSA/EC certificates for home devices with support for SAN (FQDN, shortname and IP's) also as .PFX
+A simple, interactive Bash script for creating a custom Certificate Authority (CA) and issuing certificates using OpenSSL.  
+Ideal for local development, self-hosted services (e.g., UniFi, web servers), and WPA2/WPA3-Enterprise WiFi with EAP-TLS authentication.
 
-| 1 | Initial creation: Basic bash script to create CA if not exists (asks for CN and validity), generates single RSA client cert with CN, signs using inline OpenSSL config, exports to .key, .crt, .pfx, creates client dir based on CN, handles serial/index. |
+## Features
 
-| 8 | Major expansion: Added certificate type selection (client/server) with corresponding extensions (usr_client: clientAuth; usr_server: serverAuth), optional SAN input with parsing for DNS/IP prefixes, generates both RSA (2048) and EC (prime256v1) keys/certs simultaneously, shared PFX passphrase prompt, suffix in filenames based on type, copy_extensions=copy in config. |
+- Creates a root CA (4096-bit RSA) if none exists, with user-defined Common Name and validity.
+- Generates both **RSA (2048-bit)** and **ECDSA (prime256v1)** key pairs simultaneously.
+- Supports four certificate types:
+  - `client` – for general client authentication
+  - `server` – for web servers (TLS serverAuth)
+  - `wifi-client` – for EAP-TLS client authentication on devices (Android, iOS, macOS)
+  - `wifi-server` – for RADIUS / access point server authentication
+- Automatic **Subject Alternative Name (SAN)** inclusion:
+  - Common Name is always added as the first SAN
+  - Optional additional SANs (DNS or IP, comma-separated)
+- Exports in multiple formats:
+  - `.key` (private key)
+  - `.crt` (certificate)
+  - `.pfx` (PKCS#12 with CA chain, optional passphrase) – compatible with Windows, Android, iOS, macOS
+- Minimal interaction, self-contained (no external config files needed)
 
-| 9 | SAN enhancement: Always includes the Common Name (CN) as the first SAN entry (with DNS/IP detection), changed SAN prompt to "additional SANs" to reflect automatic CN inclusion. |
+## Prerequisites
 
-| 10 | WiFi support addition: Extended certificate type options to include wifi-client and wifi-server (mapping to same usr_client/usr_server extensions), adjusted suffix in filenames for wifi types to distinguish them. |
+- macOS, Linux, or any system with Bash and OpenSSL 1.1+ / 3.x
+- Run in Terminal
 
-| 11 | Added changelog comment at the beginning of the script. |
+## Usage
 
-test commmit
+1. Save the script as `cert-generator.sh`
+2. Make it executable:  
+   ```bash
+   chmod +x cert-generator.sh
+   ```
+3. Run it:  
+   ```bash
+   ./cert-generator.sh
+   ```
+
+The script will guide you through prompts:
+
+- If no CA exists: enter CA Common Name and validity (days).
+- Choose certificate type: `client`, `server`, `wifi-client`, or `wifi-server`
+- Enter Common Name (e.g., `unifi.local` or `user1`)
+- Optional: additional SANs (comma-separated)
+- Optional: passphrase for .pfx export
+
+## Expected Output
+
+- `CA/` folder with root CA key, certificate, index, and serial files (created once)
+- A folder named after the Common Name containing:
+  - `CN-rsa-[type].key` / `.crt` / `.pfx`
+  - `CN-ec-[type].key` / `.crt` / `.pfx`  
+    (where `[type]` is `client`, `server`, `wifi-client`, or `wifi-server`)
+
+Example files for CN `unifi.local` and type `wifi-server`:
+```
+unifi.local/
+├── unifi.local-rsa-wifi-server.key
+├── unifi.local-rsa-wifi-server.crt
+├── unifi.local-rsa-wifi-server.pfx
+├── unifi.local-ec-wifi-server.key
+├── unifi.local-ec-wifi-server.crt
+└── unifi.local-ec-wifi-server.pfx
+```
+
+## Notes
+
+- For web servers: trust the CA in browsers and import the server cert.
+- For WiFi EAP-TLS: use `wifi-server` cert on RADIUS/AP, `wifi-client` .pfx on devices.
+- Always verify certificates with `openssl verify` or `openssl s_client`.
+
+## Changelog Summary
+
+| Version | Changes |
+|---------|---------|
+| 1       | Initial basic client cert generator |
+| 8       | Added client/server types, dual RSA+EC, SAN support, extensions |
+| 9       | Always include CN in SAN |
+| 10      | Added wifi-client and wifi-server types |
+| 11      | Added this changelog and README guidance |
