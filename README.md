@@ -11,3 +11,5 @@ oneliner to quickly create CA (if not existent already) and issue RSA/EC certifi
 | 10 | WiFi support addition: Extended certificate type options to include wifi-client and wifi-server (mapping to same usr_client/usr_server extensions), adjusted suffix in filenames for wifi types to distinguish them. |
 
 | 11 | Added changelog comment at the beginning of the script. |
+
+test commmit
