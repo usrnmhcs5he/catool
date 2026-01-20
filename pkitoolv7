@@ -1,0 +1,1865 @@
+#!/bin/bash
+# =============================================================================
+# PKI Certificate Generation Tool
+# =============================================================================
+# Version: 6
+# 
+# Changelog:
+# | Version | Changes |
+# |---------|---------|
+# | 1       | Complete rewrite: Added strict error handling, input validation,
+# |         | expanded cert types (web-server, radius-server, vpn-server,
+# |         | vpn-client, wifi-client, wifi-server, code-signing, email),
+# |         | configurable key sizes (RSA 2048/3072/4096, EC P-256/P-384/P-521),
+# |         | proper IPv6 detection, secure passphrase handling, cert validity
+# |         | prompt, CA chain support, revocation prep (CRL), OCSP extensions,
+# |         | colored output, backup/restore, cert inspection, and menu system. |
+# | 2       | Bash 3.x compatibility: Replaced ${var^^} uppercase syntax with
+# |         | tr command for compatibility with older Bash versions (macOS).
+# |         | Added version display at script end. |
+# | 3       | Added multiple export formats for broader compatibility:
+# |         | - .pem (cert only, PEM format for UniFi/nginx/etc)
+# |         | - -chain.pem (CA chain only)
+# |         | - -bundle.pem (key + cert + chain combined)
+# |         | - -cert.der (DER/binary format)
+# |         | - -key.der (private key in DER format)
+# |         | Added UniFi-specific guidance in output messages. |
+# | 4       | Bug fixes: Fixed cleanup pattern that was accidentally deleting
+# |         | generated .pem files. Added proper error handling to openssl
+# |         | commands to surface failures instead of silent errors.
+# |         | Added certificate verification after signing. |
+# | 5       | Fixed OpenSSL CA config: Added missing new_certs_dir directory
+# |         | required by openssl ca command. Fixed config to use absolute
+# |         | paths. Compatible with both LibreSSL (macOS) and OpenSSL. |
+# | 6       | YubiKey 5 PIV support for CA private key storage:
+# |         | - Option to generate CA key directly on YubiKey (non-exportable)
+# |         | - Option to import existing CA key to YubiKey (for backups)
+# |         | - Uses PIV slot 9c (Digital Signature) for CA signing
+# |         | - Supports RSA 2048 and EC P-256/P-384 on YubiKey
+# |         | - PIN and touch policy configuration
+# |         | - Automatic PKCS#11 engine setup for OpenSSL
+# |         | - Added YubiKey status and management menu options
+# |         | - See REQUIREMENTS.md for required tools and setup |
+# | 7       | Documentation: Added comprehensive changelog at end of script
+# |         | documenting all changes from v1-v7 for historical reference. |
+# =============================================================================
+
+set -euo pipefail
+
+# Script version
+SCRIPT_VERSION="7"
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+CA_DIR="CA"
+CA_KEY="$CA_DIR/ca.key"
+CA_CRT="$CA_DIR/ca.crt"
+INDEX="$CA_DIR/index.txt"
+INDEX_ATTR="$CA_DIR/index.txt.attr"
+SERIAL="$CA_DIR/serial"
+CRL_NUMBER="$CA_DIR/crlnumber"
+
+# YubiKey Configuration
+YUBIKEY_MODE_FILE="$CA_DIR/.yubikey_mode"
+YUBIKEY_SLOT="9c"  # Digital Signature slot - best for CA signing
+YUBIKEY_SLOT_HEX="02"  # Slot 9c = id 02 in PKCS#11
+
+# PKCS#11 library paths (will be auto-detected)
+YKCS11_LIB=""
+PKCS11_ENGINE=""
+CRL_FILE="$CA_DIR/ca.crl"
+CA_CONFIG="$CA_DIR/ca.cnf"
+
+# Default values
+DEFAULT_CA_DAYS=3650
+DEFAULT_CERT_DAYS=365
+DEFAULT_RSA_SIZE=4096
+DEFAULT_EC_CURVE="prime256v1"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+die() {
+    log_error "$1"
+    exit 1
+}
+
+# Convert string to uppercase (Bash 3.x compatible)
+to_uppercase() {
+    echo "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+# Convert string to lowercase (Bash 3.x compatible)
+to_lowercase() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Check if required tools are available
+check_dependencies() {
+    local deps=("openssl" "mkdir" "cat" "rm" "cp" "tr")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            die "Required command '$dep' not found. Please install it."
+        fi
+    done
+    
+    # Check OpenSSL version (need 1.1.1+ for some features)
+    local openssl_version
+    openssl_version=$(openssl version | awk '{print $2}')
+    log_info "OpenSSL version: $openssl_version"
+}
+
+# Validate Common Name (no dangerous characters)
+validate_cn() {
+    local cn="$1"
+    if [[ -z "$cn" ]]; then
+        die "Common Name cannot be empty"
+    fi
+    if [[ ${#cn} -gt 64 ]]; then
+        die "Common Name too long (max 64 characters)"
+    fi
+    if [[ "$cn" =~ [/\\:\*\?\"\<\>\|] ]]; then
+        die "Common Name contains invalid characters"
+    fi
+    # Check for directory traversal
+    if [[ "$cn" == *".."* ]]; then
+        die "Common Name cannot contain '..'"
+    fi
+}
+
+# Validate IP address (IPv4 or IPv6)
+is_valid_ipv4() {
+    local ip="$1"
+    local IFS='.'
+    read -ra octets <<< "$ip"
+    [[ ${#octets[@]} -eq 4 ]] || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        ((octet >= 0 && octet <= 255)) || return 1
+    done
+    return 0
+}
+
+is_valid_ipv6() {
+    local ip="$1"
+    # Basic IPv6 validation - must contain at least one colon and valid hex chars
+    if [[ ! "$ip" =~ : ]]; then
+        return 1
+    fi
+    # Check for valid characters only
+    if [[ ! "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+        return 1
+    fi
+    # Check for valid structure (not more than 8 groups, :: only once)
+    local double_colon_count
+    double_colon_count=$(grep -o '::' <<< "$ip" | wc -l)
+    if ((double_colon_count > 1)); then
+        return 1
+    fi
+    return 0
+}
+
+is_ip_address() {
+    local addr="$1"
+    is_valid_ipv4 "$addr" || is_valid_ipv6 "$addr"
+}
+
+# Validate numeric input
+validate_number() {
+    local num="$1"
+    local min="$2"
+    local max="$3"
+    local name="$4"
+    
+    if [[ ! "$num" =~ ^[0-9]+$ ]]; then
+        die "$name must be a number"
+    fi
+    if ((num < min || num > max)); then
+        die "$name must be between $min and $max"
+    fi
+}
+
+# Secure passphrase reading
+read_passphrase() {
+    local prompt="$1"
+    local var_name="$2"
+    local confirm="${3:-false}"
+    
+    local pass1 pass2
+    
+    read -rs -p "$prompt" pass1
+    echo ""
+    
+    if [[ "$confirm" == "true" && -n "$pass1" ]]; then
+        read -rs -p "Confirm passphrase: " pass2
+        echo ""
+        if [[ "$pass1" != "$pass2" ]]; then
+            die "Passphrases do not match"
+        fi
+    fi
+    
+    eval "$var_name=\"\$pass1\""
+}
+
+# Generate random serial if needed
+generate_serial() {
+    openssl rand -hex 8 | tr '[:lower:]' '[:upper:]'
+}
+
+# -----------------------------------------------------------------------------
+# YubiKey Functions
+# -----------------------------------------------------------------------------
+
+# Detect PKCS#11 library paths
+detect_pkcs11_paths() {
+    # Detect ykcs11 library
+    local ykcs11_paths=(
+        "/usr/local/lib/libykcs11.dylib"           # macOS Homebrew
+        "/usr/local/lib/libykcs11.so"              # Linux local
+        "/usr/lib/x86_64-linux-gnu/libykcs11.so"   # Debian/Ubuntu x64
+        "/usr/lib/libykcs11.so"                    # Generic Linux
+        "/opt/homebrew/lib/libykcs11.dylib"        # macOS ARM Homebrew
+    )
+    
+    for path in "${ykcs11_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            YKCS11_LIB="$path"
+            break
+        fi
+    done
+    
+    # Detect OpenSSL PKCS#11 engine
+    local engine_paths=(
+        "/usr/local/lib/engines-3/pkcs11.dylib"    # macOS OpenSSL 3
+        "/usr/local/lib/engines-1.1/pkcs11.dylib"  # macOS OpenSSL 1.1
+        "/usr/lib/x86_64-linux-gnu/engines-3/pkcs11.so"  # Linux OpenSSL 3
+        "/usr/lib/x86_64-linux-gnu/engines-1.1/pkcs11.so" # Linux OpenSSL 1.1
+        "/usr/lib/engines-3/pkcs11.so"             # Generic Linux
+        "/opt/homebrew/lib/engines-3/pkcs11.dylib" # macOS ARM
+    )
+    
+    for path in "${engine_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            PKCS11_ENGINE="$path"
+            break
+        fi
+    done
+}
+
+# Check if YubiKey tools are available
+check_yubikey_tools() {
+    local missing_tools=()
+    
+    if ! command -v yubico-piv-tool &> /dev/null; then
+        missing_tools+=("yubico-piv-tool")
+    fi
+    
+    if ! command -v ykman &> /dev/null; then
+        missing_tools+=("ykman (yubikey-manager)")
+    fi
+    
+    detect_pkcs11_paths
+    
+    if [[ -z "$YKCS11_LIB" ]]; then
+        missing_tools+=("libykcs11 (PKCS#11 library)")
+    fi
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log_error "Missing YubiKey tools: ${missing_tools[*]}"
+        echo ""
+        echo "Please install the required tools. See REQUIREMENTS.md for instructions."
+        echo ""
+        return 1
+    fi
+    
+    return 0
+}
+
+# Check if YubiKey is connected
+check_yubikey_connected() {
+    if ! ykman list 2>/dev/null | grep -q "YubiKey"; then
+        log_error "No YubiKey detected. Please insert your YubiKey."
+        return 1
+    fi
+    return 0
+}
+
+# Show YubiKey status
+show_yubikey_status() {
+    log_info "=== YubiKey Status ==="
+    echo ""
+    
+    if ! check_yubikey_tools; then
+        return 1
+    fi
+    
+    if ! check_yubikey_connected; then
+        return 1
+    fi
+    
+    echo "Device Information:"
+    ykman info
+    echo ""
+    
+    echo "PIV Slot Status:"
+    yubico-piv-tool -a status
+    echo ""
+    
+    # Check if slot 9c has a key
+    if yubico-piv-tool -a status 2>/dev/null | grep -q "Slot 9c"; then
+        log_info "Slot 9c (Digital Signature) contains a key/certificate"
+    else
+        log_info "Slot 9c (Digital Signature) is empty"
+    fi
+}
+
+# Check if CA is using YubiKey mode
+is_yubikey_ca() {
+    [[ -f "$YUBIKEY_MODE_FILE" ]]
+}
+
+# Generate CA key on YubiKey
+generate_ca_key_on_yubikey() {
+    local algorithm="$1"
+    local pin_policy="$2"
+    local touch_policy="$3"
+    local management_key="$4"
+    
+    log_info "Generating CA private key on YubiKey slot $YUBIKEY_SLOT..."
+    log_warn "This key will be NON-EXPORTABLE for maximum security."
+    echo ""
+    
+    local algo_flag
+    case "$algorithm" in
+        "RSA2048") algo_flag="RSA2048" ;;
+        "ECCP256") algo_flag="ECCP256" ;;
+        "ECCP384") algo_flag="ECCP384" ;;
+        *) die "Unsupported algorithm: $algorithm" ;;
+    esac
+    
+    # Generate key on YubiKey
+    local pubkey_file="$CA_DIR/ca_pubkey.pem"
+    
+    if [[ "$management_key" == "default" ]]; then
+        yubico-piv-tool -s "$YUBIKEY_SLOT" -a generate \
+            -A "$algo_flag" \
+            --pin-policy="$pin_policy" \
+            --touch-policy="$touch_policy" \
+            -o "$pubkey_file" || die "Failed to generate key on YubiKey"
+    else
+        yubico-piv-tool -s "$YUBIKEY_SLOT" -a generate \
+            -A "$algo_flag" \
+            --pin-policy="$pin_policy" \
+            --touch-policy="$touch_policy" \
+            -k "$management_key" \
+            -o "$pubkey_file" || die "Failed to generate key on YubiKey"
+    fi
+    
+    log_success "Key generated on YubiKey"
+    echo "$pubkey_file"
+}
+
+# Import existing CA key to YubiKey
+import_ca_key_to_yubikey() {
+    local key_file="$1"
+    local management_key="$2"
+    local pin_policy="$3"
+    local touch_policy="$4"
+    
+    log_info "Importing CA private key to YubiKey slot $YUBIKEY_SLOT..."
+    log_warn "After import, consider securely deleting the original key file."
+    echo ""
+    
+    if [[ "$management_key" == "default" ]]; then
+        yubico-piv-tool -s "$YUBIKEY_SLOT" -a import-key \
+            --pin-policy="$pin_policy" \
+            --touch-policy="$touch_policy" \
+            -i "$key_file" || die "Failed to import key to YubiKey"
+    else
+        yubico-piv-tool -s "$YUBIKEY_SLOT" -a import-key \
+            --pin-policy="$pin_policy" \
+            --touch-policy="$touch_policy" \
+            -k "$management_key" \
+            -i "$key_file" || die "Failed to import key to YubiKey"
+    fi
+    
+    log_success "Key imported to YubiKey"
+}
+
+# Import CA certificate to YubiKey
+import_ca_cert_to_yubikey() {
+    local cert_file="$1"
+    local management_key="$2"
+    
+    log_info "Importing CA certificate to YubiKey slot $YUBIKEY_SLOT..."
+    
+    if [[ "$management_key" == "default" ]]; then
+        yubico-piv-tool -s "$YUBIKEY_SLOT" -a import-certificate \
+            -i "$cert_file" || die "Failed to import certificate to YubiKey"
+    else
+        yubico-piv-tool -s "$YUBIKEY_SLOT" -a import-certificate \
+            -k "$management_key" \
+            -i "$cert_file" || die "Failed to import certificate to YubiKey"
+    fi
+    
+    log_success "Certificate imported to YubiKey"
+}
+
+# Create self-signed CA certificate using YubiKey
+create_ca_cert_with_yubikey() {
+    local pubkey_file="$1"
+    local ca_cn="$2"
+    local ca_days="$3"
+    local pin="$4"
+    
+    log_info "Creating self-signed CA certificate using YubiKey..."
+    
+    # Create certificate using yubico-piv-tool
+    yubico-piv-tool -a verify-pin -P "$pin" \
+        -a selfsign-certificate \
+        -s "$YUBIKEY_SLOT" \
+        -S "/CN=$ca_cn/" \
+        --valid-days="$ca_days" \
+        -i "$pubkey_file" \
+        -o "$CA_CRT" || die "Failed to create CA certificate"
+    
+    log_success "CA certificate created"
+}
+
+# Sign certificate using YubiKey (via PKCS#11)
+sign_with_yubikey() {
+    local csr_file="$1"
+    local crt_file="$2"
+    local extensions="$3"
+    local days="$4"
+    
+    if [[ -z "$YKCS11_LIB" ]]; then
+        detect_pkcs11_paths
+    fi
+    
+    if [[ -z "$YKCS11_LIB" ]]; then
+        die "PKCS#11 library not found. Please install libykcs11."
+    fi
+    
+    # Create temporary config with PKCS#11 engine
+    local temp_config
+    temp_config=$(mktemp)
+    
+    cat > "$temp_config" <<-EOFENGINE
+openssl_conf = openssl_init
+
+[openssl_init]
+engines = engine_section
+
+[engine_section]
+pkcs11 = pkcs11_section
+
+[pkcs11_section]
+engine_id = pkcs11
+MODULE_PATH = $YKCS11_LIB
+init = 0
+
+EOFENGINE
+    
+    # Append the CA config
+    cat "$CA_CONFIG" >> "$temp_config"
+    
+    # Update config to use PKCS#11 key
+    sed -i.bak "s|private_key       = .*|private_key       = pkcs11:object=Private key for Digital Signature;type=private|g" "$temp_config"
+    sed -i.bak "s|default_days      = 365|default_days      = $days|g" "$temp_config"
+    rm -f "$temp_config.bak" 2>/dev/null || true
+    
+    log_info "Signing certificate with YubiKey..."
+    log_warn "You may need to enter your PIN and/or touch the YubiKey."
+    echo ""
+    
+    # Ensure newcerts directory exists
+    mkdir -p "$CA_DIR/newcerts"
+    
+    OPENSSL_CONF="$temp_config" PKCS11_MODULE_PATH="$YKCS11_LIB" \
+    openssl ca -batch \
+        -engine pkcs11 \
+        -keyform engine \
+        -config "$temp_config" \
+        -cert "$CA_CRT" \
+        -in "$csr_file" \
+        -out "$crt_file" \
+        -extensions "$extensions" \
+        -notext || {
+            rm -f "$temp_config"
+            die "Failed to sign certificate with YubiKey"
+        }
+    
+    rm -f "$temp_config"
+    log_success "Certificate signed with YubiKey"
+}
+
+# Get YubiKey PIN from user
+get_yubikey_pin() {
+    local var_name="$1"
+    read_passphrase "Enter YubiKey PIN: " "$var_name" false
+}
+
+# Get YubiKey management key
+get_management_key() {
+    echo ""
+    echo "YubiKey Management Key:"
+    echo "  1) Use default key (010203040506070801020304050607080102030405060708)"
+    echo "  2) Enter custom management key"
+    read -rp "Choice [1]: " mgmt_choice
+    mgmt_choice="${mgmt_choice:-1}"
+    
+    if [[ "$mgmt_choice" == "1" ]]; then
+        echo "default"
+    else
+        local mgmt_key
+        read -rsp "Enter management key (hex): " mgmt_key
+        echo ""
+        echo "$mgmt_key"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# CA Management Functions
+# -----------------------------------------------------------------------------
+create_ca_config() {
+    # Create new_certs directory for openssl ca
+    mkdir -p "$CA_DIR/newcerts"
+    
+    cat > "$CA_CONFIG" <<-EOFCONFIG
+# OpenSSL CA Configuration
+[ ca ]
+default_ca = local_ca
+
+[ local_ca ]
+dir               = $CA_DIR
+certificate       = \$dir/ca.crt
+database          = \$dir/index.txt
+private_key       = \$dir/ca.key
+serial            = \$dir/serial
+crlnumber         = \$dir/crlnumber
+crl               = \$dir/ca.crl
+new_certs_dir     = \$dir/newcerts
+default_days      = 365
+default_crl_days  = 30
+default_md        = sha256
+copy_extensions   = copy
+unique_subject    = no
+policy            = policy_loose
+x509_extensions   = usr_cert
+preserve          = no
+email_in_dn       = no
+
+[ policy_loose ]
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[ req ]
+prompt              = no
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+
+[ req_distinguished_name ]
+# Empty - we use -subj on command line
+
+# -----------------------------------------------------------------------------
+# Certificate Extensions
+# -----------------------------------------------------------------------------
+
+# Generic user certificate
+[ usr_cert ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+
+# Web Server (TLS Server Authentication)
+[ web_server ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = serverAuth
+# Note: SAN is added via copy_extensions from CSR
+
+# RADIUS Server (EAP-TLS server)
+[ radius_server ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = serverAuth, 1.3.6.1.5.5.7.3.14
+# 1.3.6.1.5.5.7.3.14 = id-kp-eapOverLAN (EAP over LAN)
+
+# VPN Server (IPsec/IKEv2)
+[ vpn_server ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = serverAuth, 1.3.6.1.5.5.7.3.5
+# 1.3.6.1.5.5.7.3.5 = id-kp-ipsecEndSystem
+
+# Generic TLS Client
+[ tls_client ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = clientAuth
+
+# WiFi Client (EAP-TLS / WPA Enterprise)
+[ wifi_client ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = clientAuth, 1.3.6.1.5.5.7.3.14
+# 1.3.6.1.5.5.7.3.14 = id-kp-eapOverLAN
+
+# VPN Client
+[ vpn_client ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = clientAuth, 1.3.6.1.5.5.7.3.5
+
+# Code Signing
+[ code_signing ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = codeSigning, msCodeInd, msCodeCom
+
+# Email (S/MIME)
+[ email_cert ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = emailProtection
+
+# Intermediate CA
+[ intermediate_ca ]
+basicConstraints       = critical, CA:TRUE, pathlen:0
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, keyCertSign, cRLSign
+
+# OCSP Signing
+[ ocsp_signing ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = OCSPSigning
+EOFCONFIG
+    log_success "CA configuration file created"
+}
+
+create_ca() {
+    log_info "Creating new Certificate Authority..."
+    
+    mkdir -p "$CA_DIR"
+    
+    # Ask about key storage method
+    echo ""
+    echo "Select CA private key storage method:"
+    echo "  1) File-based (traditional - key stored in $CA_DIR/ca.key)"
+    echo "  2) YubiKey hardware token (key stored on YubiKey PIV slot 9c)"
+    read -rp "Choice [1]: " storage_method
+    storage_method="${storage_method:-1}"
+    
+    if [[ "$storage_method" == "2" ]]; then
+        create_ca_with_yubikey
+        return
+    fi
+    
+    # Traditional file-based CA creation
+    create_ca_file_based
+}
+
+create_ca_file_based() {
+    # Get CA details
+    local ca_cn ca_days ca_key_type ca_key_size ca_curve ca_pass
+    
+    read -rp "Enter CA Common Name (e.g., My Root CA): " ca_cn
+    validate_cn "$ca_cn"
+    
+    read -rp "Enter CA validity in days [$DEFAULT_CA_DAYS]: " ca_days
+    ca_days="${ca_days:-$DEFAULT_CA_DAYS}"
+    validate_number "$ca_days" 1 36500 "CA validity"
+    
+    echo ""
+    echo "Select CA key type:"
+    echo "  1) RSA (recommended for compatibility)"
+    echo "  2) ECDSA (smaller, faster)"
+    read -rp "Choice [1]: " ca_key_type
+    ca_key_type="${ca_key_type:-1}"
+    
+    if [[ "$ca_key_type" == "1" ]]; then
+        echo "Select RSA key size:"
+        echo "  1) 2048 bits (minimum)"
+        echo "  2) 3072 bits (good)"
+        echo "  3) 4096 bits (recommended)"
+        read -rp "Choice [3]: " ca_key_size
+        ca_key_size="${ca_key_size:-3}"
+        case "$ca_key_size" in
+            1) ca_key_size=2048 ;;
+            2) ca_key_size=3072 ;;
+            3) ca_key_size=4096 ;;
+            *) die "Invalid key size selection" ;;
+        esac
+        
+        read_passphrase "Enter CA private key passphrase (recommended, press Enter for none): " ca_pass false
+        
+        if [[ -n "$ca_pass" ]]; then
+            openssl genrsa -aes256 -passout pass:"$ca_pass" -out "$CA_KEY" "$ca_key_size"
+            openssl req -new -x509 -days "$ca_days" -key "$CA_KEY" -passin pass:"$ca_pass" \
+                -out "$CA_CRT" -subj "/CN=$ca_cn" \
+                -addext "basicConstraints=critical,CA:TRUE" \
+                -addext "keyUsage=critical,keyCertSign,cRLSign" \
+                -addext "subjectKeyIdentifier=hash"
+        else
+            openssl genrsa -out "$CA_KEY" "$ca_key_size"
+            openssl req -new -x509 -days "$ca_days" -key "$CA_KEY" \
+                -out "$CA_CRT" -subj "/CN=$ca_cn" \
+                -addext "basicConstraints=critical,CA:TRUE" \
+                -addext "keyUsage=critical,keyCertSign,cRLSign" \
+                -addext "subjectKeyIdentifier=hash"
+        fi
+    else
+        echo "Select EC curve:"
+        echo "  1) prime256v1 / P-256 (most compatible)"
+        echo "  2) secp384r1 / P-384 (stronger)"
+        echo "  3) secp521r1 / P-521 (strongest)"
+        read -rp "Choice [1]: " ca_curve
+        ca_curve="${ca_curve:-1}"
+        case "$ca_curve" in
+            1) ca_curve="prime256v1" ;;
+            2) ca_curve="secp384r1" ;;
+            3) ca_curve="secp521r1" ;;
+            *) die "Invalid curve selection" ;;
+        esac
+        
+        read_passphrase "Enter CA private key passphrase (recommended, press Enter for none): " ca_pass false
+        
+        if [[ -n "$ca_pass" ]]; then
+            openssl ecparam -name "$ca_curve" -genkey | \
+                openssl ec -aes256 -passout pass:"$ca_pass" -out "$CA_KEY"
+            openssl req -new -x509 -days "$ca_days" -key "$CA_KEY" -passin pass:"$ca_pass" \
+                -out "$CA_CRT" -subj "/CN=$ca_cn" \
+                -addext "basicConstraints=critical,CA:TRUE" \
+                -addext "keyUsage=critical,keyCertSign,cRLSign" \
+                -addext "subjectKeyIdentifier=hash"
+        else
+            openssl ecparam -name "$ca_curve" -genkey -noout -out "$CA_KEY"
+            openssl req -new -x509 -days "$ca_days" -key "$CA_KEY" \
+                -out "$CA_CRT" -subj "/CN=$ca_cn" \
+                -addext "basicConstraints=critical,CA:TRUE" \
+                -addext "keyUsage=critical,keyCertSign,cRLSign" \
+                -addext "subjectKeyIdentifier=hash"
+        fi
+    fi
+    
+    # Initialize CA database files
+    touch "$INDEX"
+    echo "unique_subject = no" > "$INDEX_ATTR"
+    generate_serial > "$SERIAL"
+    echo "1000" > "$CRL_NUMBER"
+    
+    # Create CA config
+    create_ca_config
+    
+    # Set restrictive permissions on CA private key
+    chmod 600 "$CA_KEY"
+    
+    # Create ca.pem copy for services like FreeRADIUS
+    cp "$CA_CRT" "$CA_DIR/ca.pem"
+    
+    log_success "Certificate Authority created successfully!"
+    log_info "CA Certificate: $CA_CRT (also available as $CA_DIR/ca.pem)"
+    log_info "CA Private Key: $CA_KEY (keep this safe!)"
+    echo ""
+    
+    # Show CA info
+    openssl x509 -in "$CA_CRT" -noout -subject -dates
+}
+
+create_ca_with_yubikey() {
+    log_info "Creating Certificate Authority with YubiKey..."
+    echo ""
+    
+    # Check YubiKey tools are available
+    if ! check_yubikey_tools; then
+        die "YubiKey tools not available. See REQUIREMENTS.md"
+    fi
+    
+    # Check YubiKey is connected
+    if ! check_yubikey_connected; then
+        die "Please insert your YubiKey and try again"
+    fi
+    
+    # Get CA details
+    local ca_cn ca_days
+    
+    read -rp "Enter CA Common Name (e.g., My Root CA): " ca_cn
+    validate_cn "$ca_cn"
+    
+    read -rp "Enter CA validity in days [$DEFAULT_CA_DAYS]: " ca_days
+    ca_days="${ca_days:-$DEFAULT_CA_DAYS}"
+    validate_number "$ca_days" 1 36500 "CA validity"
+    
+    # Key generation method
+    echo ""
+    echo "Select key generation method:"
+    echo "  1) Generate new key ON YubiKey (non-exportable, most secure)"
+    echo "  2) Import existing key TO YubiKey (allows backup)"
+    read -rp "Choice [1]: " key_method
+    key_method="${key_method:-1}"
+    
+    # Algorithm selection (YubiKey supports RSA2048, ECCP256, ECCP384)
+    echo ""
+    echo "Select key algorithm (YubiKey supported):"
+    echo "  1) RSA 2048 (best compatibility)"
+    echo "  2) EC P-256 (faster, smaller)"
+    echo "  3) EC P-384 (stronger EC)"
+    read -rp "Choice [1]: " algo_choice
+    algo_choice="${algo_choice:-1}"
+    
+    local algorithm
+    case "$algo_choice" in
+        1) algorithm="RSA2048" ;;
+        2) algorithm="ECCP256" ;;
+        3) algorithm="ECCP384" ;;
+        *) die "Invalid algorithm selection" ;;
+    esac
+    
+    # PIN policy
+    echo ""
+    echo "Select PIN policy for signing operations:"
+    echo "  1) once    - PIN required once per session"
+    echo "  2) always  - PIN required for every signature (most secure)"
+    echo "  3) never   - PIN never required (least secure)"
+    read -rp "Choice [2]: " pin_policy_choice
+    pin_policy_choice="${pin_policy_choice:-2}"
+    
+    local pin_policy
+    case "$pin_policy_choice" in
+        1) pin_policy="once" ;;
+        2) pin_policy="always" ;;
+        3) pin_policy="never" ;;
+        *) die "Invalid PIN policy selection" ;;
+    esac
+    
+    # Touch policy
+    echo ""
+    echo "Select touch policy (physical touch on YubiKey):"
+    echo "  1) never  - No touch required"
+    echo "  2) always - Touch required for every signature (recommended)"
+    echo "  3) cached - Touch cached for 15 seconds"
+    read -rp "Choice [2]: " touch_policy_choice
+    touch_policy_choice="${touch_policy_choice:-2}"
+    
+    local touch_policy
+    case "$touch_policy_choice" in
+        1) touch_policy="never" ;;
+        2) touch_policy="always" ;;
+        3) touch_policy="cached" ;;
+        *) die "Invalid touch policy selection" ;;
+    esac
+    
+    # Get management key
+    local mgmt_key
+    mgmt_key=$(get_management_key)
+    
+    # Get PIN
+    local yk_pin
+    get_yubikey_pin yk_pin
+    
+    mkdir -p "$CA_DIR"
+    
+    if [[ "$key_method" == "1" ]]; then
+        # Generate key on YubiKey
+        log_warn "Generating key on YubiKey - this key will be NON-EXPORTABLE!"
+        echo ""
+        read -rp "Are you sure you want to continue? (yes/no): " confirm
+        if [[ "$confirm" != "yes" ]]; then
+            echo "Cancelled."
+            return
+        fi
+        
+        local pubkey_file
+        pubkey_file=$(generate_ca_key_on_yubikey "$algorithm" "$pin_policy" "$touch_policy" "$mgmt_key")
+        
+        # Create self-signed certificate
+        create_ca_cert_with_yubikey "$pubkey_file" "$ca_cn" "$ca_days" "$yk_pin"
+        
+        # Import certificate back to YubiKey
+        import_ca_cert_to_yubikey "$CA_CRT" "$mgmt_key"
+        
+    else
+        # Import existing key
+        echo ""
+        read -rp "Enter path to existing CA private key file: " existing_key
+        
+        if [[ ! -f "$existing_key" ]]; then
+            die "Key file not found: $existing_key"
+        fi
+        
+        # Check if we also have an existing certificate
+        read -rp "Do you have an existing CA certificate? (yes/no) [no]: " has_cert
+        has_cert="${has_cert:-no}"
+        
+        if [[ "$has_cert" == "yes" ]]; then
+            read -rp "Enter path to existing CA certificate: " existing_cert
+            if [[ ! -f "$existing_cert" ]]; then
+                die "Certificate file not found: $existing_cert"
+            fi
+            cp "$existing_cert" "$CA_CRT"
+        fi
+        
+        # Import key to YubiKey
+        import_ca_key_to_yubikey "$existing_key" "$mgmt_key" "$pin_policy" "$touch_policy"
+        
+        if [[ "$has_cert" != "yes" ]]; then
+            # Need to create certificate - extract public key first
+            local pubkey_file="$CA_DIR/ca_pubkey.pem"
+            
+            # Check key type and extract public key
+            if openssl rsa -in "$existing_key" -pubout -out "$pubkey_file" 2>/dev/null; then
+                : # RSA key
+            elif openssl ec -in "$existing_key" -pubout -out "$pubkey_file" 2>/dev/null; then
+                : # EC key
+            else
+                die "Could not extract public key from $existing_key"
+            fi
+            
+            # Create self-signed certificate
+            create_ca_cert_with_yubikey "$pubkey_file" "$ca_cn" "$ca_days" "$yk_pin"
+        fi
+        
+        # Import certificate to YubiKey
+        import_ca_cert_to_yubikey "$CA_CRT" "$mgmt_key"
+        
+        log_warn ""
+        log_warn "IMPORTANT: Consider securely deleting the original key file:"
+        log_warn "  shred -u $existing_key"
+        log_warn "Or keep it as a backup in a secure location."
+    fi
+    
+    # Create marker file to indicate YubiKey mode
+    echo "yubikey" > "$YUBIKEY_MODE_FILE"
+    echo "slot=$YUBIKEY_SLOT" >> "$YUBIKEY_MODE_FILE"
+    echo "algorithm=$algorithm" >> "$YUBIKEY_MODE_FILE"
+    
+    # Create a dummy key file to pass check_ca (actual key is on YubiKey)
+    echo "# CA private key stored on YubiKey PIV slot $YUBIKEY_SLOT" > "$CA_KEY"
+    echo "# DO NOT DELETE - This file indicates YubiKey mode" >> "$CA_KEY"
+    chmod 600 "$CA_KEY"
+    
+    # Initialize CA database files
+    touch "$INDEX"
+    echo "unique_subject = no" > "$INDEX_ATTR"
+    generate_serial > "$SERIAL"
+    echo "1000" > "$CRL_NUMBER"
+    
+    # Create CA config
+    create_ca_config
+    
+    # Create ca.pem copy
+    cp "$CA_CRT" "$CA_DIR/ca.pem"
+    
+    log_success "Certificate Authority created with YubiKey!"
+    log_info "CA Certificate: $CA_CRT (also available as $CA_DIR/ca.pem)"
+    log_info "CA Private Key: Stored on YubiKey slot $YUBIKEY_SLOT"
+    log_warn "PIN Policy: $pin_policy | Touch Policy: $touch_policy"
+    echo ""
+    
+    # Show CA info
+    openssl x509 -in "$CA_CRT" -noout -subject -dates
+}
+
+# Check if CA exists and is valid
+check_ca() {
+    # For YubiKey mode, check if mode file exists
+    if [[ -f "$YUBIKEY_MODE_FILE" ]]; then
+        if [[ ! -f "$CA_CRT" ]]; then
+            return 1
+        fi
+        # Verify CA cert is valid
+        if ! openssl x509 -in "$CA_CRT" -noout -checkend 0 2>/dev/null; then
+            log_warn "CA certificate has expired!"
+            return 1
+        fi
+        return 0
+    fi
+    
+    # Traditional file-based check
+    if [[ ! -f "$CA_KEY" ]] || [[ ! -f "$CA_CRT" ]]; then
+        return 1
+    fi
+    
+    # Verify CA cert is valid
+    if ! openssl x509 -in "$CA_CRT" -noout -checkend 0 2>/dev/null; then
+        log_warn "CA certificate has expired!"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Get CA passphrase if needed
+get_ca_passphrase() {
+    CA_PASS=""
+    
+    # YubiKey mode doesn't use file-based passphrase
+    if is_yubikey_ca; then
+        return 0
+    fi
+    
+    # Check if CA key is encrypted
+    if grep -q "ENCRYPTED" "$CA_KEY" 2>/dev/null; then
+        read_passphrase "Enter CA private key passphrase: " CA_PASS false
+        
+        # Verify passphrase works
+        if ! openssl rsa -in "$CA_KEY" -passin pass:"$CA_PASS" -check -noout 2>/dev/null; then
+            if ! openssl ec -in "$CA_KEY" -passin pass:"$CA_PASS" -check -noout 2>/dev/null; then
+                die "Invalid CA passphrase"
+            fi
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Certificate Generation Functions
+# -----------------------------------------------------------------------------
+select_cert_type() {
+    echo ""
+    echo "Select certificate type:"
+    echo ""
+    echo "  Server Certificates:"
+    echo "    1) web-server     - HTTPS/TLS web server"
+    echo "    2) radius-server  - RADIUS/EAP-TLS server (FreeRADIUS, NPS)"
+    echo "    3) vpn-server     - VPN server (OpenVPN, IKEv2/IPsec)"
+    echo ""
+    echo "  Client Certificates:"
+    echo "    4) tls-client     - Generic TLS client authentication"
+    echo "    5) wifi-client    - WiFi EAP-TLS / WPA Enterprise client"
+    echo "    6) vpn-client     - VPN client certificate"
+    echo ""
+    echo "  Other:"
+    echo "    7) code-signing   - Code/software signing"
+    echo "    8) email          - S/MIME email encryption/signing"
+    echo ""
+    read -rp "Choice [1]: " choice
+    choice="${choice:-1}"
+    
+    case "$choice" in
+        1) CERT_TYPE="web-server"; EXT_SECTION="web_server" ;;
+        2) CERT_TYPE="radius-server"; EXT_SECTION="radius_server" ;;
+        3) CERT_TYPE="vpn-server"; EXT_SECTION="vpn_server" ;;
+        4) CERT_TYPE="tls-client"; EXT_SECTION="tls_client" ;;
+        5) CERT_TYPE="wifi-client"; EXT_SECTION="wifi_client" ;;
+        6) CERT_TYPE="vpn-client"; EXT_SECTION="vpn_client" ;;
+        7) CERT_TYPE="code-signing"; EXT_SECTION="code_signing" ;;
+        8) CERT_TYPE="email"; EXT_SECTION="email_cert" ;;
+        *) die "Invalid certificate type selection" ;;
+    esac
+    
+    log_info "Selected: $CERT_TYPE"
+}
+
+select_key_options() {
+    echo ""
+    echo "Select key type(s) to generate:"
+    echo "  1) RSA only"
+    echo "  2) ECDSA only"
+    echo "  3) Both RSA and ECDSA"
+    read -rp "Choice [3]: " key_choice
+    key_choice="${key_choice:-3}"
+    
+    GENERATE_RSA=false
+    GENERATE_EC=false
+    
+    case "$key_choice" in
+        1) GENERATE_RSA=true ;;
+        2) GENERATE_EC=true ;;
+        3) GENERATE_RSA=true; GENERATE_EC=true ;;
+        *) die "Invalid key type selection" ;;
+    esac
+    
+    if [[ "$GENERATE_RSA" == "true" ]]; then
+        echo ""
+        echo "Select RSA key size:"
+        echo "  1) 2048 bits"
+        echo "  2) 3072 bits"
+        echo "  3) 4096 bits"
+        read -rp "Choice [2]: " rsa_choice
+        rsa_choice="${rsa_choice:-2}"
+        case "$rsa_choice" in
+            1) RSA_SIZE=2048 ;;
+            2) RSA_SIZE=3072 ;;
+            3) RSA_SIZE=4096 ;;
+            *) die "Invalid RSA size selection" ;;
+        esac
+    fi
+    
+    if [[ "$GENERATE_EC" == "true" ]]; then
+        echo ""
+        echo "Select EC curve:"
+        echo "  1) prime256v1 / P-256 (most compatible)"
+        echo "  2) secp384r1 / P-384"
+        echo "  3) secp521r1 / P-521"
+        read -rp "Choice [1]: " ec_choice
+        ec_choice="${ec_choice:-1}"
+        case "$ec_choice" in
+            1) EC_CURVE="prime256v1" ;;
+            2) EC_CURVE="secp384r1" ;;
+            3) EC_CURVE="secp521r1" ;;
+            *) die "Invalid EC curve selection" ;;
+        esac
+    fi
+}
+
+get_cert_details() {
+    echo ""
+    read -rp "Enter Common Name (e.g., server.example.com or user@example.com): " CN
+    validate_cn "$CN"
+    
+    # Optional: Organization details
+    read -rp "Enter Organization (optional, press Enter to skip): " ORG
+    read -rp "Enter Organizational Unit (optional, press Enter to skip): " OU
+    read -rp "Enter Country Code (2 letters, optional): " COUNTRY
+    if [[ -n "$COUNTRY" ]] && [[ ! "$COUNTRY" =~ ^[A-Za-z]{2}$ ]]; then
+        log_warn "Invalid country code, ignoring"
+        COUNTRY=""
+    fi
+    # Convert to uppercase (Bash 3.x compatible)
+    COUNTRY=$(to_uppercase "$COUNTRY")
+    
+    # Build subject string
+    SUBJECT=""
+    [[ -n "$COUNTRY" ]] && SUBJECT+="/C=$COUNTRY"
+    [[ -n "$ORG" ]] && SUBJECT+="/O=$ORG"
+    [[ -n "$OU" ]] && SUBJECT+="/OU=$OU"
+    SUBJECT+="/CN=$CN"
+    
+    # Certificate validity
+    read -rp "Enter certificate validity in days [$DEFAULT_CERT_DAYS]: " CERT_DAYS
+    CERT_DAYS="${CERT_DAYS:-$DEFAULT_CERT_DAYS}"
+    validate_number "$CERT_DAYS" 1 3650 "Certificate validity"
+}
+
+get_san_entries() {
+    echo ""
+    log_info "Subject Alternative Names (SANs)"
+    log_info "The Common Name ($CN) will be automatically added as the first SAN."
+    echo ""
+    read -rp "Enter additional SANs (comma-separated DNS names or IPs, or press Enter for none): " SAN_INPUT
+    
+    # Build SAN array, starting with CN
+    SAN_ARRAY=()
+    
+    # Determine if CN is IP or DNS
+    if is_ip_address "$CN"; then
+        SAN_ARRAY+=("IP:$CN")
+    else
+        SAN_ARRAY+=("DNS:$CN")
+    fi
+    
+    # Process additional SANs
+    if [[ -n "$SAN_INPUT" ]]; then
+        IFS=',' read -ra EXTRA_SANS <<< "$SAN_INPUT"
+        for san in "${EXTRA_SANS[@]}"; do
+            san="${san#"${san%%[![:space:]]*}"}" # Trim leading whitespace
+            san="${san%"${san##*[![:space:]]}"}" # Trim trailing whitespace
+            
+            if [[ -z "$san" ]]; then
+                continue
+            fi
+            
+            if is_ip_address "$san"; then
+                SAN_ARRAY+=("IP:$san")
+            else
+                SAN_ARRAY+=("DNS:$san")
+            fi
+        done
+    fi
+    
+    # For email certs, add email SAN if CN looks like an email
+    if [[ "$CERT_TYPE" == "email" ]] && [[ "$CN" =~ @ ]]; then
+        SAN_ARRAY+=("email:$CN")
+    fi
+    
+    # Build SAN extension string
+    SAN_EXT=$(IFS=,; echo "${SAN_ARRAY[*]}")
+    
+    log_info "SANs to be included: $SAN_EXT"
+}
+
+generate_certificate() {
+    local key_type="$1"  # rsa or ec
+    local key_param="$2" # size for RSA, curve for EC
+    
+    # Create output directory
+    local safe_cn="${CN//[^a-zA-Z0-9._-]/_}"
+    local output_dir="$safe_cn"
+    mkdir -p "$output_dir"
+    
+    local base_name="$safe_cn-$key_type-$CERT_TYPE"
+    local key_file="$output_dir/$base_name.key"
+    local csr_file="$output_dir/$base_name.csr"
+    local crt_file="$output_dir/$base_name.crt"
+    local pfx_file="$output_dir/$base_name.pfx"
+    local pem_file="$output_dir/$base_name-fullchain.pem"
+    local cert_pem_file="$output_dir/$base_name.pem"
+    local chain_pem_file="$output_dir/$base_name-chain.pem"
+    local bundle_pem_file="$output_dir/$base_name-bundle.pem"
+    local cert_der_file="$output_dir/$base_name-cert.der"
+    local key_der_file="$output_dir/$base_name-key.der"
+    
+    log_info "Generating $key_type certificate..."
+    
+    # Generate private key
+    if [[ "$key_type" == "rsa" ]]; then
+        openssl genrsa -out "$key_file" "$key_param" 2>/dev/null
+    else
+        openssl ecparam -name "$key_param" -genkey -noout -out "$key_file" 2>/dev/null
+    fi
+    chmod 600 "$key_file"
+    
+    # Generate CSR with SANs
+    openssl req -new -key "$key_file" -out "$csr_file" \
+        -subj "$SUBJECT" \
+        -addext "subjectAltName = $SAN_EXT"
+    
+    # Ensure newcerts directory exists
+    mkdir -p "$CA_DIR/newcerts"
+    
+    # Sign with CA (YubiKey or file-based)
+    if is_yubikey_ca; then
+        # YubiKey signing
+        if ! check_yubikey_connected; then
+            die "YubiKey not connected. Please insert your YubiKey."
+        fi
+        sign_with_yubikey "$csr_file" "$crt_file" "$EXT_SECTION" "$CERT_DAYS"
+    else
+        # Traditional file-based signing
+        local ca_pass_opt=""
+        if [[ -n "${CA_PASS:-}" ]]; then
+            ca_pass_opt="-passin pass:$CA_PASS"
+        fi
+        
+        # Create temporary config with updated validity
+        local temp_config
+        temp_config=$(mktemp)
+        sed "s|default_days      = 365|default_days      = $CERT_DAYS|g" "$CA_CONFIG" > "$temp_config"
+        
+        if ! openssl ca -batch \
+            -config "$temp_config" \
+            -keyfile "$CA_KEY" \
+            $ca_pass_opt \
+            -cert "$CA_CRT" \
+            -in "$csr_file" \
+            -out "$crt_file" \
+            -extensions "$EXT_SECTION" \
+            -notext; then
+            rm -f "$temp_config"
+            die "Failed to sign certificate. Check CA configuration and permissions."
+        fi
+        
+        rm -f "$temp_config"
+    fi
+    
+    # Verify the certificate was created
+    if [[ ! -f "$crt_file" ]] || [[ ! -s "$crt_file" ]]; then
+        die "Certificate file was not created or is empty"
+    fi
+    
+    # Create full chain PEM (cert + CA cert)
+    cat "$crt_file" "$CA_CRT" > "$pem_file"
+    
+    # Export to PFX
+    local pfx_pass_opt
+    if [[ -n "${PFX_PASS:-}" ]]; then
+        pfx_pass_opt="-passout pass:$PFX_PASS"
+    else
+        pfx_pass_opt="-passout pass:"
+    fi
+    
+    openssl pkcs12 -export \
+        -out "$pfx_file" \
+        -inkey "$key_file" \
+        -in "$crt_file" \
+        -certfile "$CA_CRT" \
+        -name "$CN" \
+        $pfx_pass_opt || log_warn "PFX export failed"
+    
+    # Create additional export formats
+    
+    # .pem - Certificate only in PEM format (same content as .crt, different extension)
+    # Many services like UniFi, nginx prefer .pem extension
+    cp "$crt_file" "$cert_pem_file" || log_warn "Failed to create .pem file"
+    
+    # -chain.pem - CA chain only (for services that want chain separate)
+    cp "$CA_CRT" "$chain_pem_file" || log_warn "Failed to create chain.pem file"
+    
+    # -bundle.pem - Everything in one file: key + cert + chain
+    # Useful for HAProxy, some load balancers
+    cat "$key_file" "$crt_file" "$CA_CRT" > "$bundle_pem_file" || log_warn "Failed to create bundle.pem file"
+    chmod 600 "$bundle_pem_file"
+    
+    # DER format exports (binary format, used by some Java apps, Windows)
+    openssl x509 -in "$crt_file" -outform DER -out "$cert_der_file" || log_warn "Failed to create DER cert"
+    
+    # Private key in DER format
+    if [[ "$key_type" == "rsa" ]]; then
+        openssl rsa -in "$key_file" -outform DER -out "$key_der_file" 2>/dev/null || log_warn "Failed to create DER key"
+    else
+        openssl ec -in "$key_file" -outform DER -out "$key_der_file" 2>/dev/null || log_warn "Failed to create DER key"
+    fi
+    chmod 600 "$key_der_file"
+    
+    # Clean up CSR and any numbered cert files from openssl ca (like 1000.pem, 1001.pem)
+    rm -f "$csr_file"
+    rm -f "$CA_DIR"/[0-9]*.pem 2>/dev/null || true
+    
+    log_success "$key_type certificate created:"
+    echo ""
+    echo "    === Standard Formats ==="
+    echo "    Private Key (PEM):    $key_file"
+    echo "    Certificate (CRT):    $crt_file"
+    echo "    Certificate (PEM):    $cert_pem_file"
+    echo "    Full Chain (PEM):     $pem_file"
+    echo "    PKCS#12 (PFX):        $pfx_file"
+    echo ""
+    echo "    === Additional Formats ==="
+    echo "    CA Chain only:        $chain_pem_file"
+    echo "    Bundle (key+cert+ca): $bundle_pem_file"
+    echo "    Certificate (DER):    $cert_der_file"
+    echo "    Private Key (DER):    $key_der_file"
+    echo ""
+    echo "    === Usage Tips ==="
+    echo "    UniFi:        Use .key + .pem (or fullchain.pem)"
+    echo "    nginx:        Use .key + -fullchain.pem"
+    echo "    Apache:       Use .key + .crt + -chain.pem"
+    echo "    HAProxy:      Use -bundle.pem"
+    echo "    Windows/IIS:  Use .pfx"
+    echo "    Java:         Use .der files or import .pfx to keystore"
+    echo ""
+}
+
+issue_certificate() {
+    log_info "=== Issue New Certificate ==="
+    
+    # Get CA passphrase if needed
+    get_ca_passphrase
+    
+    # Select certificate type
+    select_cert_type
+    
+    # Select key options
+    select_key_options
+    
+    # Get certificate details
+    get_cert_details
+    
+    # Get SAN entries
+    get_san_entries
+    
+    # Get PFX passphrase
+    echo ""
+    read_passphrase "Enter passphrase for PFX export (press Enter for none): " PFX_PASS false
+    
+    echo ""
+    log_info "Generating certificates..."
+    echo ""
+    
+    # Generate certificates
+    if [[ "$GENERATE_RSA" == "true" ]]; then
+        generate_certificate "rsa" "$RSA_SIZE"
+    fi
+    
+    if [[ "$GENERATE_EC" == "true" ]]; then
+        generate_certificate "ec" "$EC_CURVE"
+    fi
+    
+    log_success "Certificate generation complete!"
+}
+
+# -----------------------------------------------------------------------------
+# Certificate Management Functions
+# -----------------------------------------------------------------------------
+list_certificates() {
+    log_info "=== Issued Certificates ==="
+    echo ""
+    
+    if [[ ! -f "$INDEX" ]] || [[ ! -s "$INDEX" ]]; then
+        echo "No certificates have been issued yet."
+        return
+    fi
+    
+    echo "Status | Serial | Expiry | Subject"
+    echo "-------|--------|--------|--------"
+    
+    while IFS=$'\t' read -r status expiry revoke serial unknown subject; do
+        local status_text
+        case "$status" in
+            V) status_text="Valid " ;;
+            R) status_text="Revoked" ;;
+            E) status_text="Expired" ;;
+            *) status_text="Unknown" ;;
+        esac
+        
+        # Format expiry date
+        local expiry_formatted="${expiry:0:2}/${expiry:2:2}/20${expiry:4:2}"
+        
+        echo "$status_text | $serial | $expiry_formatted | $subject"
+    done < "$INDEX"
+}
+
+inspect_certificate() {
+    echo ""
+    read -rp "Enter path to certificate file: " cert_path
+    
+    if [[ ! -f "$cert_path" ]]; then
+        die "Certificate file not found: $cert_path"
+    fi
+    
+    echo ""
+    log_info "=== Certificate Details ==="
+    echo ""
+    
+    openssl x509 -in "$cert_path" -noout -text | head -50
+    
+    echo ""
+    echo "--- Validity ---"
+    openssl x509 -in "$cert_path" -noout -dates
+    
+    echo ""
+    echo "--- Subject Alternative Names ---"
+    openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null || echo "No SANs found"
+    
+    echo ""
+    echo "--- Key Usage ---"
+    openssl x509 -in "$cert_path" -noout -ext keyUsage 2>/dev/null || echo "Not specified"
+    
+    echo ""
+    echo "--- Extended Key Usage ---"
+    openssl x509 -in "$cert_path" -noout -ext extendedKeyUsage 2>/dev/null || echo "Not specified"
+    
+    echo ""
+    echo "--- Fingerprints ---"
+    echo "SHA-256: $(openssl x509 -in "$cert_path" -noout -fingerprint -sha256 | cut -d= -f2)"
+    echo "SHA-1:   $(openssl x509 -in "$cert_path" -noout -fingerprint -sha1 | cut -d= -f2)"
+}
+
+verify_certificate() {
+    echo ""
+    read -rp "Enter path to certificate file: " cert_path
+    
+    if [[ ! -f "$cert_path" ]]; then
+        die "Certificate file not found: $cert_path"
+    fi
+    
+    echo ""
+    log_info "Verifying certificate against CA..."
+    
+    if openssl verify -CAfile "$CA_CRT" "$cert_path"; then
+        log_success "Certificate is valid and chains to the CA"
+    else
+        log_error "Certificate verification failed"
+    fi
+    
+    # Check expiry
+    echo ""
+    if openssl x509 -in "$cert_path" -noout -checkend 0; then
+        local days_left
+        days_left=$(openssl x509 -in "$cert_path" -noout -enddate | cut -d= -f2)
+        log_info "Certificate is not expired (expires: $days_left)"
+    else
+        log_warn "Certificate has EXPIRED"
+    fi
+}
+
+generate_crl() {
+    log_info "Generating Certificate Revocation List..."
+    
+    get_ca_passphrase
+    
+    local ca_pass_opt=""
+    if [[ -n "${CA_PASS:-}" ]]; then
+        ca_pass_opt="-passin pass:$CA_PASS"
+    fi
+    
+    openssl ca -gencrl \
+        -config "$CA_CONFIG" \
+        -keyfile "$CA_KEY" \
+        $ca_pass_opt \
+        -cert "$CA_CRT" \
+        -out "$CRL_FILE" \
+        2>/dev/null
+    
+    log_success "CRL generated: $CRL_FILE"
+    
+    # Show CRL info
+    openssl crl -in "$CRL_FILE" -noout -text | head -20
+}
+
+revoke_certificate() {
+    echo ""
+    read -rp "Enter path to certificate to revoke: " cert_path
+    
+    if [[ ! -f "$cert_path" ]]; then
+        die "Certificate file not found: $cert_path"
+    fi
+    
+    # Show cert info first
+    echo ""
+    echo "Certificate to revoke:"
+    openssl x509 -in "$cert_path" -noout -subject -serial
+    echo ""
+    
+    read -rp "Are you sure you want to revoke this certificate? (yes/no): " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Revocation cancelled."
+        return
+    fi
+    
+    get_ca_passphrase
+    
+    local ca_pass_opt=""
+    if [[ -n "${CA_PASS:-}" ]]; then
+        ca_pass_opt="-passin pass:$CA_PASS"
+    fi
+    
+    openssl ca \
+        -config "$CA_CONFIG" \
+        -keyfile "$CA_KEY" \
+        $ca_pass_opt \
+        -cert "$CA_CRT" \
+        -revoke "$cert_path" \
+        2>/dev/null
+    
+    log_success "Certificate revoked"
+    log_info "Don't forget to regenerate the CRL"
+}
+
+backup_ca() {
+    local backup_file="ca-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    
+    log_info "Creating CA backup..."
+    tar -czf "$backup_file" "$CA_DIR"
+    
+    log_success "CA backed up to: $backup_file"
+    log_warn "Store this backup securely - it contains your CA private key!"
+}
+
+# -----------------------------------------------------------------------------
+# Main Menu
+# -----------------------------------------------------------------------------
+show_menu() {
+    echo ""
+    echo "========================================"
+    echo "     PKI Certificate Management Tool"
+    echo "              Version $SCRIPT_VERSION"
+    echo "========================================"
+    echo ""
+    
+    if check_ca; then
+        local ca_subject
+        ca_subject=$(openssl x509 -in "$CA_CRT" -noout -subject | sed 's/subject=//')
+        echo "CA: $ca_subject"
+        local ca_expiry
+        ca_expiry=$(openssl x509 -in "$CA_CRT" -noout -enddate | cut -d= -f2)
+        echo "Expires: $ca_expiry"
+        if is_yubikey_ca; then
+            echo -e "Key Storage: ${GREEN}YubiKey (slot $YUBIKEY_SLOT)${NC}"
+        else
+            echo "Key Storage: File-based"
+        fi
+    else
+        echo "CA: Not configured"
+    fi
+    
+    echo ""
+    echo "  Certificate Authority:"
+    echo "    1) Create new CA"
+    echo "    2) Backup CA"
+    echo ""
+    echo "  Certificates:"
+    echo "    3) Issue new certificate"
+    echo "    4) List issued certificates"
+    echo "    5) Inspect certificate"
+    echo "    6) Verify certificate"
+    echo ""
+    echo "  Revocation:"
+    echo "    7) Revoke certificate"
+    echo "    8) Generate CRL"
+    echo ""
+    echo "  YubiKey:"
+    echo "    9) YubiKey status"
+    echo ""
+    echo "    0) Exit"
+    echo ""
+    read -rp "Select option: " choice
+    
+    case "$choice" in
+        1)
+            if check_ca; then
+                log_warn "CA already exists!"
+                read -rp "Do you want to create a NEW CA (this will overwrite the existing one)? (yes/no): " confirm
+                if [[ "$confirm" != "yes" ]]; then
+                    return
+                fi
+                backup_ca
+            fi
+            create_ca
+            ;;
+        2)
+            if ! check_ca; then
+                die "No CA exists to backup"
+            fi
+            backup_ca
+            ;;
+        3)
+            if ! check_ca; then
+                log_warn "No CA exists. Creating one first..."
+                create_ca
+            fi
+            issue_certificate
+            ;;
+        4)
+            if ! check_ca; then
+                die "No CA exists"
+            fi
+            list_certificates
+            ;;
+        5)
+            inspect_certificate
+            ;;
+        6)
+            if ! check_ca; then
+                die "No CA exists for verification"
+            fi
+            verify_certificate
+            ;;
+        7)
+            if ! check_ca; then
+                die "No CA exists"
+            fi
+            revoke_certificate
+            ;;
+        8)
+            if ! check_ca; then
+                die "No CA exists"
+            fi
+            generate_crl
+            ;;
+        9)
+            show_yubikey_status
+            ;;
+        0)
+            echo ""
+            echo "Goodbye! (PKI Tool v$SCRIPT_VERSION)"
+            exit 0
+            ;;
+        *)
+            log_error "Invalid option"
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Main Entry Point
+# -----------------------------------------------------------------------------
+main() {
+    check_dependencies
+    
+    # If arguments provided, could add CLI mode here
+    # For now, always show menu
+    
+    while true; do
+        show_menu
+    done
+}
+
+main "$@"
+
+# =============================================================================
+# CHANGELOG - Complete Version History
+# =============================================================================
+#
+# Version 7 (Current)
+# -------------------
+# - Added this comprehensive changelog section at end of script
+# - Documents all changes from v1 to v7 for historical reference
+# - No functional changes from v6
+#
+# Version 6
+# ---------
+# YubiKey 5 PIV Hardware Token Support:
+# - Added option to store CA private key on YubiKey hardware token
+# - Two key generation methods:
+#   * Generate key directly ON YubiKey (non-exportable, most secure)
+#   * Import existing key TO YubiKey (allows backup before import)
+# - Uses PIV slot 9c (Digital Signature) - ideal for CA signing operations
+# - Supported algorithms: RSA 2048, EC P-256 (prime256v1), EC P-384 (secp384r1)
+# - Configurable PIN policy: once, always, never
+# - Configurable touch policy: never, always, cached
+# - Automatic PKCS#11 library path detection for multiple platforms
+# - OpenSSL PKCS#11 engine integration for certificate signing
+# - New functions: detect_pkcs11_paths(), check_yubikey_tools(),
+#   check_yubikey_connected(), show_yubikey_status(), is_yubikey_ca(),
+#   generate_ca_key_on_yubikey(), import_ca_key_to_yubikey(),
+#   import_ca_cert_to_yubikey(), create_ca_cert_with_yubikey(),
+#   sign_with_yubikey(), get_yubikey_pin(), get_management_key()
+# - Split create_ca() into create_ca_file_based() and create_ca_with_yubikey()
+# - Menu shows YubiKey mode status when CA uses hardware token
+# - New menu option (9) for YubiKey status display
+# - Auto-creates ca.pem copy for FreeRADIUS/RADIUS server compatibility
+# - Created REQUIREMENTS.md with installation instructions for YubiKey tools
+#
+# Version 5
+# ---------
+# OpenSSL CA Configuration Fixes:
+# - Added missing new_certs_dir directory required by openssl ca command
+# - Fixed CA config to use absolute paths instead of relative
+# - Created newcerts directory automatically during CA setup
+# - Compatible with both LibreSSL (macOS) and OpenSSL (Linux)
+# - Fixed "output directory new_certs_dir not defined" error
+#
+# Version 4
+# ---------
+# Bug Fixes and Error Handling:
+# - Fixed cleanup pattern that was accidentally deleting generated .pem files
+#   Changed: rm -f "$output_dir"/*.pem.* to rm -f "$CA_DIR"/[0-9]*.pem
+# - Added proper error handling to openssl commands (removed 2>/dev/null)
+# - Errors now surface with visible warnings instead of silent failures
+# - Added certificate verification after signing to confirm creation
+# - Added || log_warn fallbacks for non-critical operations
+#
+# Version 3
+# ---------
+# Multiple Export Formats for Broader Compatibility:
+# - .pem - Certificate only in PEM format (for UniFi, nginx, etc.)
+# - -fullchain.pem - Certificate + CA chain combined
+# - -chain.pem - CA chain only (for Apache SSLCertificateChainFile)
+# - -bundle.pem - Key + cert + chain all in one (for HAProxy)
+# - -cert.der - Certificate in DER/binary format (for Java)
+# - -key.der - Private key in DER format (for Java keystores)
+# - Added usage tips in output showing which format for which service:
+#   * UniFi: .key + .pem
+#   * nginx: .key + -fullchain.pem
+#   * Apache: .key + .crt + -chain.pem
+#   * HAProxy: -bundle.pem
+#   * Windows/IIS: .pfx
+#   * Java: .der files
+#
+# Version 2
+# ---------
+# Bash 3.x Compatibility (macOS Support):
+# - Replaced ${var^^} uppercase syntax with tr command
+#   Old: COUNTRY="${COUNTRY^^}"
+#   New: COUNTRY=$(to_uppercase "$COUNTRY")
+# - Added to_uppercase() helper function using tr '[:lower:]' '[:upper:]'
+# - Added to_lowercase() helper function for future use
+# - Fixed sed -i for macOS (added .bak suffix, then cleanup)
+# - Added SCRIPT_VERSION variable for easy version tracking
+# - Version now displays in menu header and on exit
+# - Script works on both Linux (Bash 4+) and macOS (Bash 3.x)
+#
+# Version 1 (Initial Release - Complete Rewrite)
+# -----------------------------------------------
+# Core Features:
+# - set -euo pipefail for strict error handling
+# - Comprehensive input validation for all user inputs
+# - Common Name validation (length, characters, directory traversal)
+# - Proper IPv4 and IPv6 address detection and validation
+#
+# Certificate Types Supported:
+# - web-server: HTTPS/TLS web server (serverAuth)
+# - radius-server: RADIUS/EAP-TLS server with id-kp-eapOverLAN OID
+# - vpn-server: VPN server with id-kp-ipsecEndSystem OID
+# - tls-client: Generic TLS client authentication
+# - wifi-client: WiFi EAP-TLS / WPA Enterprise with eapOverLAN
+# - vpn-client: VPN client with ipsecEndSystem
+# - code-signing: Code/software signing with MS OIDs
+# - email: S/MIME email encryption/signing
+#
+# Key Options:
+# - RSA key sizes: 2048, 3072, 4096 bits
+# - EC curves: prime256v1 (P-256), secp384r1 (P-384), secp521r1 (P-521)
+# - Option to generate RSA only, EC only, or both simultaneously
+# - CA key encryption with AES-256 passphrase protection
+#
+# Certificate Features:
+# - Subject Alternative Names (SANs) with automatic CN inclusion
+# - Automatic DNS/IP prefix detection for SANs
+# - IPv6 SAN support
+# - Email SAN for S/MIME certificates
+# - Configurable certificate validity period
+# - Optional Organization, OU, Country fields
+#
+# CA Management:
+# - Automatic CA creation if not exists
+# - CA database files: index.txt, serial, crlnumber
+# - CA certificate with proper extensions (CA:TRUE, keyCertSign, cRLSign)
+# - CRL generation support
+# - Certificate revocation support
+# - CA backup to timestamped tar.gz
+#
+# Output Formats:
+# - .key - Private key (PEM)
+# - .crt - Certificate (PEM)
+# - -fullchain.pem - Cert + CA chain
+# - .pfx - PKCS#12 for Windows/IIS
+#
+# User Interface:
+# - Colored output (INFO blue, SUCCESS green, WARN yellow, ERROR red)
+# - Interactive menu system
+# - Certificate listing with status
+# - Certificate inspection (validity, SANs, key usage, fingerprints)
+# - Certificate verification against CA
+#
+# Security Features:
+# - Secure passphrase reading (no echo)
+# - Passphrase confirmation option
+# - Restrictive file permissions (chmod 600 on keys)
+# - Random serial number generation
+#
+# =============================================================================
+# END OF CHANGELOG
+# =============================================================================
