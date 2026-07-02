@@ -1,82 +1,81 @@
 # Certificate Generator Script
 
-A simple, interactive Bash script for creating a custom Certificate Authority (CA) and issuing certificates using OpenSSL.  
-Ideal for local development, self-hosted services (e.g., UniFi, web servers), and WPA2/WPA3-Enterprise WiFi with EAP-TLS authentication.
+An interactive Bash script for creating a local Certificate Authority (CA) and
+issuing certificates with OpenSSL — with optional YubiKey PIV backing for the
+CA key. Ideal for local development, self-hosted services (e.g., UniFi, web
+servers), and WPA2/WPA3-Enterprise WiFi with EAP-TLS authentication.
 
 ## Features
 
-- Creates a root CA (4096-bit RSA) if none exists, with user-defined Common Name and validity.
-- Generates both **RSA (2048-bit)** and **ECDSA (prime256v1)** key pairs simultaneously.
-- Supports four certificate types:
-  - `client` – for general client authentication
-  - `server` – for web servers (TLS serverAuth)
-  - `wifi-client` – for EAP-TLS client authentication on devices (Android, iOS, macOS)
-  - `wifi-server` – for RADIUS / access point server authentication
-- Automatic **Subject Alternative Name (SAN)** inclusion:
-  - Common Name is always added as the first SAN
-  - Optional additional SANs (DNS or IP, comma-separated)
-- Exports in multiple formats:
-  - `.key` (private key)
-  - `.crt` (certificate)
-  - `.pfx` (PKCS#12 with CA chain, optional passphrase) – compatible with Windows, Android, iOS, macOS
-- Minimal interaction, self-contained (no external config files needed)
+- Creates a root CA if none exists — key type selectable
+  (`rsa3072` default for YubiKey compatibility, `rsa2048`, `ecp256`),
+  optional AES-256 passphrase on the CA key
+- **YubiKey PIV support**: import the CA to slot 9a and sign via PKCS#11,
+  so the CA key never has to live on disk during issuance
+- Generates both **RSA (2048)** and **ECDSA (prime256v1)** key pairs per run
+- Four certificate types via numbered menu:
+  `client`, `server`, `wifi-client` (EAP-TLS devices), `wifi-server` (RADIUS/AP)
+- Automatic **SAN** handling: CN always included first; optional additional
+  SANs (comma-separated, `DNS:`/`IP:` prefixes or auto-detected)
+- Per-run certificate validity prompt (default 365 days)
+- Exports `.key`, `.crt`, and `.pfx` (PKCS#12 with CA chain, optional
+  passphrase) — Windows / Android / iOS / macOS compatible
+- Self-contained: no external config files; Bash 3.2 compatible (stock macOS)
 
 ## Prerequisites
 
-- macOS, Linux, or any system with Bash and OpenSSL 1.1+ / 3.x
-- Run in Terminal
+- Bash and OpenSSL 1.1+ / 3.x (macOS, Linux)
+- For YubiKey signing only: `yubico-piv-tool`, OpenSC, and the OpenSSL
+  `pkcs11` engine (libp11)
 
 ## Usage
 
-1. Save the script as `cert-generator.sh`
-2. Make it executable:  
-   ```bash
-   chmod +x cert-generator.sh
-   ```
-3. Run it:  
-   ```bash
-   ./cert-generator.sh
-   ```
+```bash
+chmod +x cert-generator.sh
+./cert-generator.sh
+```
 
-The script will guide you through prompts:
+Follow the prompts: CA creation (first run only) → optional YubiKey import →
+signing backend (file / YubiKey) → certificate type → CN → additional SANs →
+validity → PFX passphrase.
 
-- If no CA exists: enter CA Common Name and validity (days).
-- Choose certificate type: `client`, `server`, `wifi-client`, or `wifi-server`
-- Enter Common Name (e.g., `unifi.local` or `user1`)
-- Optional: additional SANs (comma-separated)
-- Optional: passphrase for .pfx export
+Optional environment variables:
 
-## Expected Output
+| Variable      | Effect                                              |
+|---------------|-----------------------------------------------------|
+| `CERT_DAYS`   | Preset validity, skips the prompt                   |
+| `CA_KEY_URI`  | PKCS#11 URI override for the CA key (YubiKey mode)  |
+| `PFX_LEGACY=1`| Legacy PKCS#12 encryption for old Windows/devices   |
 
-- `CA/` folder with root CA key, certificate, index, and serial files (created once)
-- A folder named after the Common Name containing:
-  - `CN-rsa-[type].key` / `.crt` / `.pfx`
-  - `CN-ec-[type].key` / `.crt` / `.pfx`  
-    (where `[type]` is `client`, `server`, `wifi-client`, or `wifi-server`)
+## Output
 
-Example files for CN `unifi.local` and type `wifi-server`:
+- `CA/` — root CA key, certificate, index and serial files (created once;
+  existing CA state is picked up and continued)
+- `<CN>/` — issued material, e.g. for CN `unifi.local`, type `wifi-server`:
+
 ```
 unifi.local/
-├── unifi.local-rsa-wifi-server.key
-├── unifi.local-rsa-wifi-server.crt
-├── unifi.local-rsa-wifi-server.pfx
-├── unifi.local-ec-wifi-server.key
-├── unifi.local-ec-wifi-server.crt
-└── unifi.local-ec-wifi-server.pfx
+├── unifi.local-rsa-wifi-server.{key,crt,pfx}
+└── unifi.local-ec-wifi-server.{key,crt,pfx}
 ```
+
+Existing output files prompt before being overwritten.
 
 ## Notes
 
-- For web servers: trust the CA in browsers and import the server cert.
-- For WiFi EAP-TLS: use `wifi-server` cert on RADIUS/AP, `wifi-client` .pfx on devices.
-- Always verify certificates with `openssl verify` or `openssl s_client`.
+- Web servers: trust the CA in the client trust store, deploy the server cert.
+- WiFi EAP-TLS: `wifi-server` cert on RADIUS/AP, `wifi-client` `.pfx` on devices.
+- Verify issuance with `openssl verify -CAfile CA/ca.crt <cert>`.
+- Known limitation: `yubico-piv-tool` takes the management key as a CLI
+  argument (briefly visible in the process list); the tool offers no alternative.
 
 ## Changelog Summary
 
 | Version | Changes |
 |---------|---------|
-| 1       | Initial basic client cert generator |
-| 8       | Added client/server types, dual RSA+EC, SAN support, extensions |
-| 9       | Always include CN in SAN |
-| 10      | Added wifi-client and wifi-server types |
-| 11      | Added this changelog and README guidance |
+| 1–11    | Basic client certs → dual RSA+EC, cert types, SANs, wifi types |
+| 12      | YubiKey PIV import and PKCS#11 signing |
+| 13–14   | Hardening: input validation, critical KU/BC, SKI/AKI, strict mode |
+| 15      | Bug fixes (CN validation, sanitizer, Bash 3.2 compat, Python argv), passphrases off argv, validity prompt, optional CA key encryption, corrected PKCS#11 URI default, overwrite guard, ASCII menu interface |
+
+Full per-version history is kept in the script header.
