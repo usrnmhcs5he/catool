@@ -77,5 +77,7 @@ Existing output files prompt before being overwritten.
 | 12      | YubiKey PIV import and PKCS#11 signing |
 | 13–14   | Hardening: input validation, critical KU/BC, SKI/AKI, strict mode |
 | 15      | Bug fixes (CN validation, sanitizer, Bash 3.2 compat, Python argv), passphrases off argv, validity prompt, optional CA key encryption, corrected PKCS#11 URI default, overwrite guard, ASCII menu interface |
+| 16 | Navigation + visual polish: main flow restructured as a state machine; every menu now offers [b] Back and [q] Quit; every text prompt accepts :b (back) and :q (quit) tokens (silent passphrase/PIN prompts deliberately excluded so literal values are never intercepted); CA creation prompts also navigable; new pre-generation summary screen with Generate / Start over options; internal variable assignment via printf -v instead of eval; TTY-guarded bold/colour output (disabled when piped, respects NO_COLOR); step counters in section headers. No changes to cryptographic behaviour, file formats, naming, or CA state handling. |
+
 
 Full per-version history is kept in the script header.
