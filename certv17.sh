@@ -12,6 +12,7 @@
 # | 14 | More hardening: validate CN against subject injection; make KU/BC critical; strict SAN addext format; heal CA DB structure even for existing CA; modern keygen (genpkey); improved YubiKey PKCS#11 key selection via env/prompt + pkcs11-tool hint; remove unused YubiKey signing PIN prompt; add minimal dependency checks. |
 # | 15 | Bug fixes + modernisation: FIX CN validation char class that wrongly rejected any CN containing 'r' or '\' (literal '\r' in bracket expression); FIX sanitize_for_fs invalid reverse tr range '_-@' (fatal on GNU tr); restore Bash 3.2 compatibility (removed ${var^^}, guarded empty-array expansion under set -u); FIX Python code injection in is_ip_addr (input now passed as argv, not interpolated); clear stale RETURN trap in generate_cert; PFX passphrase moved off argv to fd:3; restored per-run cert validity prompt (default 365, CERT_DAYS env honoured); optional CA key encryption (AES-256, default off = previous behaviour); corrected default PKCS#11 URI to RFC 7512 id form (pkcs11:id=%01 for PIV 9a, OpenSC mapping); engine availability pre-check; overwrite warning for existing output files; PFX_LEGACY=1 env for OpenSSL3 -legacy pkcs12; ASCII interface overhaul (banner, sections, numbered menus). |
 # | 16 | Navigation + visual polish: main flow restructured as a state machine; every menu now offers [b] Back and [q] Quit; every text prompt accepts :b (back) and :q (quit) tokens (silent passphrase/PIN prompts deliberately excluded so literal values are never intercepted); CA creation prompts also navigable; new pre-generation summary screen with Generate / Start over options; internal variable assignment via printf -v instead of eval; TTY-guarded bold/colour output (disabled when piped, respects NO_COLOR); step counters in section headers. No changes to cryptographic behaviour, file formats, naming, or CA state handling. |
+# | 17 | YubiKey import secrets off argv: yubico-piv-tool is now invoked with a bare -k (it prompts for the management key itself, hidden) when the key is not factory default, and without -P (it prompts for the PIN only if the operation needs it). Neither secret appears in the process list any more. Removed the obsolete 'known limitation' note; no other changes.
 
 set -euo pipefail
 umask 077
@@ -39,9 +40,9 @@ CERT_DAYS_DEFAULT=365
 # Navigation: type ':b' to go back or ':q' to quit at any text prompt;
 # menus accept 'b' / 'q'. Passphrase/PIN prompts do not parse these tokens.
 #
-# Known limitation: yubico-piv-tool takes the management key as a command-line
-# argument (-k); it is briefly visible in the process list. The tool offers no
-# stdin/fd alternative for it.
+# YubiKey import: the management key and PIN are never passed as arguments.
+# yubico-piv-tool prompts for them itself ('-k' without a value = ask; '-P'
+# omitted = ask when needed), so they never appear in the process list.
 
 # Navigation return code used by ask()/menu(): 10 = go back one step
 NAV_BACK=10
@@ -61,7 +62,7 @@ banner() {
   cat <<'EOF'
 +============================================================+
 |                                                            |
-|      L O C A L   C A   B U I L D E R          v16          |
+|      L O C A L   C A   B U I L D E R          v17          |
 |                                                            |
 |      file CA / YubiKey PIV  .  RSA + EC  .  PFX export     |
 |                                                            |
@@ -362,22 +363,27 @@ do_yubikey_import() {
     return 0
   fi
 
-  local yk_mgmt_key="" yk_pin=""
+  local yk_default="" rc=0
+  ask yk_default "Is the YubiKey management key still the factory default? (y/n) [n]: " || rc=$?
+  [ "$rc" -eq "$NAV_BACK" ] && return "$NAV_BACK"
+  yk_default="${yk_default:-n}"
 
-  # Silent prompts: navigation tokens intentionally NOT parsed here
-  read -r -s -p "Enter YubiKey management key (empty = factory default; CHANGE IT if still default): " yk_mgmt_key
-  yk_mgmt_key="${yk_mgmt_key:-010203040506070801020304050607080102030405060708}"
-  echo
-  read -r -s -p "Enter YubiKey PIN (if set): " yk_pin
-  echo
+  # A bare '-k' makes yubico-piv-tool prompt for the management key itself
+  # (hidden input), so the key never appears on the command line. With the
+  # factory default we pass nothing and the tool uses its built-in default.
+  # '-P' is deliberately omitted: the tool asks for the PIN only if needed.
+  local -a KEY_ARG=()
+  if [ "$yk_default" != "y" ]; then
+    KEY_ARG=(-k)
+    echo "yubico-piv-tool will ask for the management key (once per step below)."
+  else
+    echo "WARNING: factory-default management key in use. Change it with 'yubico-piv-tool -a set-mgm-key'."
+  fi
 
-  PIN_ARG=()
-  [ -n "${yk_pin:-}" ] && PIN_ARG=(-P "$yk_pin")
-
-  yubico-piv-tool ${PIN_ARG[@]+"${PIN_ARG[@]}"} -a import-key -s "$CA_SLOT" -k "$yk_mgmt_key" -i "$CA_KEY" -K PEM \
+  yubico-piv-tool ${KEY_ARG[@]+"${KEY_ARG[@]}"} -a import-key -s "$CA_SLOT" -i "$CA_KEY" -K PEM \
     --pin-policy=once --touch-policy=always
 
-  yubico-piv-tool ${PIN_ARG[@]+"${PIN_ARG[@]}"} -a import-certificate -s "$CA_SLOT" -k "$yk_mgmt_key" -i "$CA_CRT" -K PEM
+  yubico-piv-tool ${KEY_ARG[@]+"${KEY_ARG[@]}"} -a import-certificate -s "$CA_SLOT" -i "$CA_CRT" -K PEM
 
   ok "CA imported to YubiKey slot $CA_SLOT."
 }
@@ -528,7 +534,8 @@ while :; do
         ask IMPORT_YK "Import existing file-based CA to YubiKey? (y/n) [n]: " || rc=$?
         if [ "$rc" -eq "$NAV_BACK" ]; then echo "  (already at first step)"; continue; fi
         if [ "${IMPORT_YK:-n}" = "y" ]; then
-          do_yubikey_import
+          rc=0; do_yubikey_import || rc=$?
+          if [ "$rc" -eq "$NAV_BACK" ]; then continue; fi   # back to the y/n question
         fi
         step=2 ;;
 
