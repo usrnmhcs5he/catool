@@ -7,7 +7,7 @@
 ![Bash 3.2+](https://img.shields.io/badge/bash-3.2%2B-4EAA25?logo=gnubash&logoColor=white)
 ![OpenSSL](https://img.shields.io/badge/OpenSSL-1.1%20%7C%203.x-721412?logo=openssl&logoColor=white)
 ![YubiKey](https://img.shields.io/badge/YubiKey-PIV%20optional-84BD00?logo=yubico&logoColor=white)
-![Version](https://img.shields.io/badge/version-16-blue)
+![Version](https://img.shields.io/badge/version-17-blue)
 
 </div>
 
@@ -44,8 +44,8 @@ WPA2/WPA3-Enterprise WiFi using EAP-TLS. One script, no config files.
 ## 🚀 Quick start
 
 ```bash
-chmod +x certv16.sh
-./certv16.sh
+chmod +x certv17.sh
+./certv17.sh
 ```
 
 The guided flow:
@@ -90,8 +90,8 @@ Existing output files prompt before being overwritten.
   ```
 
 > [!NOTE]
-> Known limitation: `yubico-piv-tool` takes the management key as a CLI argument,
-> so it is briefly visible in the process list. The tool offers no alternative.
+> During YubiKey import, `yubico-piv-tool` prompts for the management key and PIN
+> itself (once per step), so neither ever appears in the process list.
 
 ## 🕘 Changelog
 
@@ -101,6 +101,8 @@ Existing output files prompt before being overwritten.
 | 12      | YubiKey PIV import and PKCS#11 signing |
 | 13–14   | Hardening: input validation, critical KU/BC, SKI/AKI, strict mode |
 | 15      | Bug fixes (CN validation, sanitizer, Bash 3.2 compat, Python argv), passphrases off argv, validity prompt, optional CA key encryption, corrected PKCS#11 URI default, overwrite guard, ASCII menu interface |
-| **16**  | Navigation and visual polish: main flow is now a state machine; `[b]` Back / `[q]` Quit on every menu and `:b` / `:q` on text prompts (silent passphrase/PIN prompts deliberately excluded so literal values are never intercepted); navigable CA creation; pre-generation summary screen; `printf -v` instead of `eval`; TTY-guarded colour (respects `NO_COLOR`); step counters in headers. No changes to cryptographic behaviour, file formats, naming or CA state handling. |
+| 16      | Navigation and visual polish: main flow is now a state machine; `[b]` Back / `[q]` Quit on every menu and `:b` / `:q` on text prompts (silent passphrase/PIN prompts deliberately excluded so literal values are never intercepted); navigable CA creation; pre-generation summary screen; `printf -v` instead of `eval`; TTY-guarded colour (respects `NO_COLOR`); step counters in headers. No changes to cryptographic behaviour, file formats, naming or CA state handling. |
+
+| **17**  | YubiKey import secrets off argv: `yubico-piv-tool` is invoked with a bare `-k` (it prompts for the management key itself) and without `-P` (it prompts for the PIN only if needed). Removed the obsolete "known limitation" note. No other changes. |
 
 Full per-version history is kept in the script header.
