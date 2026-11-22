@@ -617,5 +617,5 @@ generate_cert "ec" "" "prime256v1"
 
 section "DONE"
 echo "CA cert (import this into trust store if needed): $CA_CRT"
-# Version 16
+# Version 17
 # Note: For a true on-YubiKey CA (no file CA private key ever), add a mode that generates the CA key on-device and self-signs via PKCS#11.
