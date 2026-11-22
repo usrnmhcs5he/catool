@@ -21,5 +21,5 @@ produce a change may appear in anything pushed to it.
 
 ## Other
 
-- Keep Bash 3.2 compatibility (stock macOS) in `certv*.sh`.
+- Keep Bash 3.2 compatibility (stock macOS) in `catool.sh`.
 - Do not reimplement cryptography outside the script; any GUI must call the script.
