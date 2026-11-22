@@ -44,8 +44,8 @@ WPA2/WPA3-Enterprise WiFi using EAP-TLS. One script, no config files.
 ## 🚀 Quick start
 
 ```bash
-chmod +x certv17.sh
-./certv17.sh
+chmod +x catool.sh
+./catool.sh
 ```
 
 The guided flow:
@@ -105,7 +105,8 @@ Existing output files prompt before being overwritten.
 
 | **17**  | YubiKey import secrets off argv: `yubico-piv-tool` is invoked with a bare `-k` (it prompts for the management key itself) and without `-P` (it prompts for the PIN only if needed). Removed the obsolete "known limitation" note. No other changes. |
 
-Full per-version history is kept in the script header.
+The script file is `catool.sh` (named `certv17.sh` up to version 17); the version
+is no longer part of the filename. Full per-version history is kept in the script header.
 
 ## 📄 License
 

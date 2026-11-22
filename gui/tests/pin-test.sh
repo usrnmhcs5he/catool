@@ -11,7 +11,7 @@ set -uo pipefail
 umask 077
 
 OSSL="${1:-openssl}"
-URI_BASE="${CA_KEY_URI:-pkcs11:id=%01}"   # slot 9a, same default as certv16.sh
+URI_BASE="${CA_KEY_URI:-pkcs11:id=%01}"   # slot 9a, same default as catool.sh
 SLOT="${CA_SLOT:-9a}"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
