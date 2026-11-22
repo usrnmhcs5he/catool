@@ -108,6 +108,10 @@ Existing output files prompt before being overwritten.
 The script file is `catool.sh` (named `certv17.sh` up to version 17); the version
 is no longer part of the filename. Full per-version history is kept in the script header.
 
+## 🔒 Security
+
+To report a security problem, see [SECURITY.md](SECURITY.md).
+
 ## 📄 License
 
 MIT. See [LICENSE](LICENSE).
