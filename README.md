@@ -106,3 +106,7 @@ Existing output files prompt before being overwritten.
 | **17**  | YubiKey import secrets off argv: `yubico-piv-tool` is invoked with a bare `-k` (it prompts for the management key itself) and without `-P` (it prompts for the PIN only if needed). Removed the obsolete "known limitation" note. No other changes. |
 
 Full per-version history is kept in the script header.
+
+## 📄 License
+
+MIT. See [LICENSE](LICENSE).
